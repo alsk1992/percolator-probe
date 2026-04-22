@@ -167,7 +167,9 @@ distinction matters less than it might seem here, because:
 ## Reproducibility
 
 Verification script, finding write-up, and attack-path notes in
-[research repo link — TBD before filing].
+the research repo: https://github.com/alsk1992/percolator-probe
+(specifically `findings/F1-oracle-clamp-disabled-mainnet.md` and
+`scripts/verify-mainnet-config.sh`).
 
 Happy to walk through the on-chain state, the attack simulation
 against devnet, or the LLM-driven monitor/pre-position pipeline

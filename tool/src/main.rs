@@ -20,6 +20,7 @@ use std::{fs, path::PathBuf};
 mod sbf;
 mod dispatch;
 mod report;
+mod audit;
 
 #[derive(Parser)]
 #[command(name = "percolator-re")]
@@ -56,6 +57,31 @@ enum Cmd {
         #[arg(long)]
         json: Option<PathBuf>,
     },
+
+    /// Audit each handler's prologue for evidence of input validation
+    /// (load-then-branch pattern). Handlers reaching syscalls/stores
+    /// without a preceding branch are flagged for manual review.
+    AuthAudit {
+        binary: PathBuf,
+        #[arg(long)]
+        json: Option<PathBuf>,
+        /// Follow the first internal call from each match-arm to the
+        /// real handler body before auditing. Default: true.
+        #[arg(long, default_value_t = true)]
+        follow_calls: bool,
+    },
+
+    /// Disassemble N instructions starting at the given PC (hex byte
+    /// offset). Useful for manual inspection of a handler prologue.
+    Disasm {
+        binary: PathBuf,
+        /// Start PC in bytes (e.g., `0x525b8`).
+        #[arg(long)]
+        pc: String,
+        /// Number of instructions to decode.
+        #[arg(long, default_value_t = 30)]
+        n: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -64,13 +90,157 @@ fn main() -> Result<()> {
         Cmd::Info { binary } => cmd_info(&binary),
         Cmd::Dispatch { binary, json } => cmd_dispatch(&binary, json.as_deref()),
         Cmd::Handlers { binary, json } => cmd_handlers(&binary, json.as_deref()),
+        Cmd::AuthAudit { binary, json, follow_calls } => {
+            cmd_auth_audit(&binary, json.as_deref(), follow_calls)
+        }
+        Cmd::Disasm { binary, pc, n } => cmd_disasm(&binary, &pc, n),
     }
 }
 
-fn load_elf(path: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>)> {
+fn parse_hex(s: &str) -> Result<usize> {
+    let s = s.trim_start_matches("0x").trim_start_matches("0X");
+    Ok(usize::from_str_radix(s, 16).with_context(|| format!("parsing hex pc: {s}"))?)
+}
+
+fn cmd_disasm(path: &std::path::Path, pc_str: &str, n: usize) -> Result<()> {
+    let (_bytes, text, text_vaddr) = load_elf(path)?;
+    let insns = sbf::decode_text(&text);
+    let vaddr = parse_hex(pc_str)? as u64;
+    let target_slot = vaddr_to_slot(vaddr, text_vaddr)
+        .with_context(|| format!("vaddr 0x{:x} is not in .text (base 0x{:x})", vaddr, text_vaddr))?;
+    let start_idx = insns
+        .iter()
+        .position(|i| i.pc == target_slot)
+        .with_context(|| format!("no instruction at vaddr=0x{:x} (slot {})", vaddr, target_slot))?;
+
+    println!("disasm @ vaddr=0x{:x} (.text slot {}, {} instructions):", vaddr, target_slot, n);
+    for step in 0..n {
+        let idx = start_idx + step;
+        if idx >= insns.len() { break; }
+        let insn = &insns[idx];
+        let abs_vaddr = slot_to_vaddr(insn.pc, text_vaddr);
+        let marker = if insn.is_exit() {
+            " <exit>"
+        } else if insn.is_syscall() {
+            " <syscall>"
+        } else if insn.is_internal_call() {
+            " <call>"
+        } else if insn.is_conditional_jump() {
+            " <jcc>"
+        } else if insn.is_unconditional_jump() {
+            " <ja>"
+        } else {
+            ""
+        };
+        // For calls + jumps, compute the absolute target vaddr.
+        let target_annot = if insn.is_internal_call() {
+            insn.call_target()
+                .map(|t| format!("  → 0x{:x}", slot_to_vaddr(t, text_vaddr)))
+                .unwrap_or_default()
+        } else if let Some(t) = insn.jump_target() {
+            if t >= 0 {
+                format!("  → 0x{:x}", slot_to_vaddr(t as usize, text_vaddr))
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        println!("  0x{:06x}  {}{}{}", abs_vaddr, insn, marker, target_annot);
+        if insn.is_exit() { break; }
+    }
+    Ok(())
+}
+
+fn cmd_auth_audit(
+    path: &std::path::Path,
+    json_out: Option<&std::path::Path>,
+    follow_calls: bool,
+) -> Result<()> {
+    let (_bytes, text, text_vaddr) = load_elf(path)?;
+    let insns = sbf::decode_text(&text);
+    let dispatch = dispatch::find_dispatch(&insns);
+    // Only audit source-valid tags.
+    let dispatch: Vec<_> = dispatch
+        .into_iter()
+        .filter(|e| dispatch::is_valid_source_tag(e.discriminator))
+        .collect();
+    let audits = audit::audit_handlers(&insns, &dispatch, follow_calls);
+
+    println!(
+        "auth-audit over {} source-valid handlers. follow_calls={}. PROLOGUE WINDOW = 80 slots.\n",
+        audits.len(), follow_calls
+    );
+    println!(
+        "{:>4} {:28} {:>4} {:>4} {:>6} {:>6} {:>6} {:>8}",
+        "tag", "name", "ldx", "br", "syB", "stB", "vldat", "firstSC"
+    );
+    println!("{}", "-".repeat(80));
+    for a in &audits {
+        let valid_mark = if a.prologue_validates { " yes  " } else { "  NO  " };
+        println!(
+            "{:4} {:28} vaddr=0x{:06x} {:>4} {:>4} {:>6} {:>6} {:>6} {:>8}",
+            a.tag,
+            a.name,
+            slot_to_vaddr(a.pc_start, text_vaddr),
+            a.prologue_loads,
+            a.prologue_branches,
+            a.syscalls_before_any_branch,
+            a.stores_before_any_branch,
+            valid_mark,
+            a.first_syscall_at
+                .map(|s| format!("+{}", s))
+                .unwrap_or_else(|| "-".to_string())
+        );
+    }
+
+    println!("\nFlagged handlers (no load+branch in prologue):");
+    let flagged: Vec<_> = audits.iter().filter(|a| !a.prologue_validates).collect();
+    if flagged.is_empty() {
+        println!("  (none — every handler shows at least one load+branch validation)");
+    } else {
+        for a in flagged {
+            println!(
+                "  tag={:3} {:28} vaddr=0x{:x}  loads={} branches={}",
+                a.tag,
+                a.name,
+                slot_to_vaddr(a.pc_start, text_vaddr),
+                a.prologue_loads,
+                a.prologue_branches
+            );
+        }
+    }
+
+    println!("\nHandlers with syscall or store BEFORE any branch (deep red flag):");
+    let red: Vec<_> = audits
+        .iter()
+        .filter(|a| a.syscalls_before_any_branch > 0 || a.stores_before_any_branch > 0)
+        .collect();
+    if red.is_empty() {
+        println!("  (none — every handler branches at least once before mutating)");
+    } else {
+        for a in red {
+            println!(
+                "  tag={:3} {:28} syB={} stB={}",
+                a.tag, a.name, a.syscalls_before_any_branch, a.stores_before_any_branch
+            );
+        }
+    }
+
+    if let Some(out) = json_out {
+        fs::write(out, serde_json::to_string_pretty(&audits)?)?;
+        println!("\nJSON written to {}", out.display());
+    }
+
+    Ok(())
+}
+
+/// Returns (full file bytes, .text bytes, .text base virtual address).
+/// PCs throughout the tool are VIRTUAL ADDRESSES so they line up with
+/// dynsym entries and source-level debugging.
+fn load_elf(path: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>, u64)> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let elf = Elf::parse(&bytes).with_context(|| "parsing ELF")?;
-    // Find .text section
     let text = elf
         .section_headers
         .iter()
@@ -85,11 +255,25 @@ fn load_elf(path: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>)> {
     let end = start + text.sh_size as usize;
     anyhow::ensure!(end <= bytes.len(), ".text extends past file");
     let text_bytes = bytes[start..end].to_vec();
-    Ok((bytes, text_bytes))
+    let text_vaddr = text.sh_addr;
+    Ok((bytes, text_bytes, text_vaddr))
+}
+
+/// Convert slot index within .text to virtual address.
+fn slot_to_vaddr(slot: usize, text_vaddr: u64) -> u64 {
+    text_vaddr + (slot as u64) * 8
+}
+
+/// Convert virtual address to slot index within .text.
+fn vaddr_to_slot(vaddr: u64, text_vaddr: u64) -> Option<usize> {
+    if vaddr < text_vaddr { return None; }
+    let byte_off = vaddr - text_vaddr;
+    if byte_off % 8 != 0 { return None; }
+    Some((byte_off / 8) as usize)
 }
 
 fn cmd_info(path: &std::path::Path) -> Result<()> {
-    let (bytes, text) = load_elf(path)?;
+    let (bytes, text, text_vaddr) = load_elf(path)?;
     let elf = Elf::parse(&bytes)?;
     let hash = Sha256::digest(&bytes);
 
@@ -98,7 +282,8 @@ fn cmd_info(path: &std::path::Path) -> Result<()> {
     println!("file_sha256   : {}", hex::encode(hash));
     println!("e_machine     : 0x{:04x} (SBF = 0x0107)", elf.header.e_machine);
     println!("e_type        : 0x{:04x}", elf.header.e_type);
-    println!("e_entry       : 0x{:x}", elf.header.e_entry);
+    println!("e_entry       : 0x{:x} (virtual)", elf.header.e_entry);
+    println!(".text vaddr   : 0x{:x}", text_vaddr);
     println!(".text size    : {} bytes", text.len());
     println!(".text sha256  : {}", hex::encode(Sha256::digest(&text)));
     println!("section count : {}", elf.section_headers.len());
@@ -114,7 +299,7 @@ fn cmd_info(path: &std::path::Path) -> Result<()> {
 }
 
 fn cmd_dispatch(path: &std::path::Path, json_out: Option<&std::path::Path>) -> Result<()> {
-    let (_bytes, text) = load_elf(path)?;
+    let (_bytes, text, text_vaddr) = load_elf(path)?;
     let insns = sbf::decode_text(&text);
 
     println!("decoded {} SBF instructions from .text", insns.len());
@@ -138,8 +323,9 @@ fn cmd_dispatch(path: &std::path::Path, json_out: Option<&std::path::Path>) -> R
     for e in &valid {
         let name = dispatch::percolator_tag_name(e.discriminator).unwrap();
         println!(
-            "  tag={:3} (0x{:02x}) {:32} → pc=0x{:08x}",
-            e.discriminator, e.discriminator, name, e.target_pc * 8
+            "  tag={:3} (0x{:02x}) {:32} → vaddr=0x{:08x}",
+            e.discriminator, e.discriminator, name,
+            slot_to_vaddr(e.target_pc, text_vaddr),
         );
     }
 
@@ -176,9 +362,9 @@ fn cmd_dispatch(path: &std::path::Path, json_out: Option<&std::path::Path>) -> R
         );
         for e in &invalid {
             println!(
-                "  discriminator=0x{:x} @ src_pc=0x{:x}",
+                "  discriminator=0x{:x} @ src_vaddr=0x{:x}",
                 e.discriminator,
-                e.source_pc * 8
+                slot_to_vaddr(e.source_pc, text_vaddr),
             );
         }
     }
@@ -192,22 +378,22 @@ fn cmd_dispatch(path: &std::path::Path, json_out: Option<&std::path::Path>) -> R
 }
 
 fn cmd_handlers(path: &std::path::Path, json_out: Option<&std::path::Path>) -> Result<()> {
-    let (_bytes, text) = load_elf(path)?;
+    let (_bytes, text, text_vaddr) = load_elf(path)?;
     let insns = sbf::decode_text(&text);
     let dispatch = dispatch::find_dispatch(&insns);
 
     let reports = report::analyze_handlers(&insns, &dispatch);
     println!("handler inventory (N={}):\n", reports.len());
     println!(
-        "{:>4} {:32} {:>8} {:>8} {:>6} {:>6}",
-        "tag", "name", "pc_start", "size_b", "calls", "syscal"
+        "{:>4} {:32} {:>10} {:>8} {:>6} {:>6}",
+        "tag", "name", "vaddr", "size_b", "calls", "syscal"
     );
     for r in &reports {
         println!(
-            "0x{:02x} {:32} 0x{:06x} {:>8} {:>6} {:>6}",
+            "0x{:02x} {:32} 0x{:08x} {:>8} {:>6} {:>6}",
             r.tag,
             r.name,
-            r.pc_start * 8,
+            slot_to_vaddr(r.pc_start, text_vaddr),
             r.approx_size_bytes,
             r.call_count,
             r.syscall_count,

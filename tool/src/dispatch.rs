@@ -23,80 +23,111 @@ pub struct DispatchEntry {
     pub test_reg: u8,
 }
 
-/// Heuristic dispatch finder.
+/// Proper dispatch-cascade detector.
 ///
-/// Approach:
-///   1. For each `jeq r<x>, imm, +N` (BPF_K source), record a candidate
-///      `(discriminator=imm, target_pc=pc+1+N, source_pc=pc, test_reg=x)`.
-///   2. Group candidates by `test_reg` into clusters (runs where the
-///      same register is being compared in a small PC window).
-///   3. Return the largest cluster — that is the dispatch cascade.
+/// A Rust `match tag { 0 => ..., 1 => ..., 2 => ..., ... }` with a
+/// dense integer domain compiles to a sequence of `jeq r<x>, imm, +N`
+/// instructions in rapid succession. The key signal is DENSITY: many
+/// jcc's against different immediates targeting the same test register,
+/// clustered in a small number of consecutive slots.
 ///
-/// This is robust against simple compiler reorderings: the tool still
-/// picks up all `jeq` sites, just potentially over-includes. The user
-/// can filter by PC range in the report.
+/// Algorithm:
+///   1. Collect every `(jeq | jne) r<x>, imm, +off` site (src=K).
+///   2. For each starting position i, find the maximal run of j such
+///      that all sites in [i..j] test the same register, are within
+///      `MAX_STRIDE` slots of the previous site, and have distinct
+///      immediates.
+///   3. Pick the longest run as the dispatch cascade.
+///
+/// Rationale: standalone jeq's (like boolean-conversion helpers) are
+/// isolated; the dispatch cascade is dozens of jeq's in a row with
+/// stride 1-4 slots.
 pub fn find_dispatch(insns: &[Insn]) -> Vec<DispatchEntry> {
-    // Collect every jeq-immediate site.
-    let mut candidates: Vec<DispatchEntry> = Vec::new();
+    // Collect every jeq/jne-against-imm site in PC order.
+    let mut sites: Vec<DispatchEntry> = Vec::new();
     for i in insns.iter() {
         let class = class_of(i.opcode);
         if class != CLASS_JMP && class != CLASS_JMP32 { continue; }
-        if alu_or_jmp_op(i.opcode) != JMP_JEQ { continue; }
+        let op = alu_or_jmp_op(i.opcode);
+        if op != JMP_JEQ && op != JMP_JNE { continue; }
         if src_bit(i.opcode) != SRC_K { continue; }
         let target = i.pc as isize + 1 + i.off as isize;
         if target < 0 { continue; }
-        candidates.push(DispatchEntry {
+        sites.push(DispatchEntry {
             discriminator: i.imm as u64,
             target_pc: target as usize,
             source_pc: i.pc,
             test_reg: i.dst,
         });
     }
+    if sites.is_empty() { return Vec::new(); }
 
-    if candidates.is_empty() { return Vec::new(); }
+    // Find the longest run of consecutive jcc-on-imm sites testing the
+    // same register with bounded stride.
+    const MAX_STRIDE: usize = 8; // slots between consecutive jcc's in cascade
+    const MIN_RUN: usize = 8;    // minimum length to be considered dispatch
 
-    // Cluster by (test_reg, approximate PC window).
-    // Two candidates are in the same cluster if they compare the same
-    // register and are within WINDOW slots of each other.
-    const WINDOW: usize = 400;
-    candidates.sort_by_key(|c| (c.test_reg, c.source_pc));
+    sites.sort_by_key(|s| s.source_pc);
 
-    let mut clusters: Vec<Vec<DispatchEntry>> = Vec::new();
-    for c in candidates {
-        let mut placed = false;
-        for cluster in clusters.iter_mut() {
-            let same_reg = cluster[0].test_reg == c.test_reg;
-            let near = cluster
-                .iter()
-                .any(|x| x.source_pc.abs_diff(c.source_pc) <= WINDOW);
-            if same_reg && near {
-                cluster.push(c.clone());
-                placed = true;
-                break;
-            }
+    let mut best_run_start = 0usize;
+    let mut best_run_len = 0usize;
+    let mut i = 0usize;
+    while i < sites.len() {
+        let mut j = i + 1;
+        let test_reg = sites[i].test_reg;
+        let mut seen_imms: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        seen_imms.insert(sites[i].discriminator);
+        while j < sites.len() {
+            if sites[j].test_reg != test_reg { break; }
+            if sites[j].source_pc - sites[j - 1].source_pc > MAX_STRIDE { break; }
+            if seen_imms.contains(&sites[j].discriminator) { break; }
+            seen_imms.insert(sites[j].discriminator);
+            j += 1;
         }
-        if !placed {
-            clusters.push(vec![c]);
+        let run_len = j - i;
+        if run_len > best_run_len {
+            best_run_start = i;
+            best_run_len = run_len;
         }
+        i = j.max(i + 1);
     }
 
-    // Pick the cluster with the most distinct discriminators.
-    let best = clusters
-        .into_iter()
-        .max_by_key(|c| {
-            let mut seen = std::collections::BTreeSet::new();
-            for e in c { seen.insert(e.discriminator); }
-            seen.len()
-        })
-        .unwrap_or_default();
-
-    // Deduplicate by discriminator (first occurrence wins).
-    let mut seen = std::collections::BTreeMap::new();
-    for e in best {
-        seen.entry(e.discriminator).or_insert(e);
+    if best_run_len < MIN_RUN {
+        return Vec::new();
     }
-    let mut out: Vec<DispatchEntry> = seen.into_values().collect();
+
+    let run = &sites[best_run_start..best_run_start + best_run_len];
+
+    // For a jeq cascade, the target is the arm body (taken when equal).
+    // For a jne cascade, the target is the NEXT-arm check (taken when
+    // not equal) — the arm body is actually the FALL-THROUGH. Detect
+    // which we have by looking at the first instruction:
+    //   - If opcode at pc == JMP_JEQ: taken target = arm body → correct as-is
+    //   - If opcode at pc == JMP_JNE: taken target = skip over fall-through
+    //     (typically to the NEXT jne), fall-through is arm body.
+    let first_op = alu_or_jmp_op(
+        insns.iter().find(|i| i.pc == run[0].source_pc).map(|i| i.opcode).unwrap_or(0)
+    );
+    let is_jne_cascade = first_op == JMP_JNE;
+
+    let mut out: Vec<DispatchEntry> = if is_jne_cascade {
+        // For jne cascade, the handler is the FALL-THROUGH: next slot
+        // after each jne. But the discriminator accepted at that arm
+        // IS the tested value (taken-not-equal means skipping when
+        // != imm, so falling through means == imm).
+        run.iter()
+            .map(|e| DispatchEntry {
+                discriminator: e.discriminator,
+                target_pc: e.source_pc + 1, // fall-through
+                source_pc: e.source_pc,
+                test_reg: e.test_reg,
+            })
+            .collect()
+    } else {
+        run.to_vec()
+    };
     out.sort_by_key(|e| e.discriminator);
+    out.dedup_by_key(|e| e.discriminator);
     out
 }
 

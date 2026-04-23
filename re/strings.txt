@@ -1,0 +1,59 @@
+UUUU-2
+CREP{!
+3333_H
+3333_H
+ $,47=
++3<*;:src/sysvar/mod.rsinternal error: entered unreachable codefailed to fill whole bufferassertion failed: min <= max/home/runner/work/platform-tools/platform-tools/out/rust/library/core/src/cmp.rs/home/runner/work/platform-tools/platform-tools/out/rust/library/alloc/src/slice.rs/home/runner/work/platform-tools/platform-tools/out/rust/library/alloc/src/raw_vec.rssrc/percolator.rsvault
+core/src/unicode/unicode_data.rs
+q^Et,#
+index out of bounds: the len is 
+Km\sU[!
+mul_div_floor_u128: a*b overflowCRANK_STATSlp
+alloc/src/fmt.rssrc/wide_math.rs) when slicing `range end index 
+0123456789abcdef/home/runner/work/platform-tools/platform-tools/out/rust/library/alloc/src/raw_vec.rssrc/instruction.rs
+src/state.rsabs_u256 called on I256::MINU256 division by zeromul_div quotient must fit U256U512 division by zeroremainder must fit U256ceil_div_positive_checked: zero denominatorceil_div overflowmul_div_floor_u256: zero denominatormul_div_floor_u256_with_rem: zero denominatormul_div_ceil_u256: zero denominatormul_div_ceil overflowmul_div_floor_u128: division by zeromul_div_ceil_u128: a*b overflowwide_mul_div_floor_u128: division by zerowide_mul_div_floor_u128: result exceeds u128src/percolator.rsmax_accounts must be in 1..=MAX_ACCOUNTSmax_active_positions_per_side must be > 0 (spec 
+1.4)max_active_positions_per_side must be <= max_accounts (spec 
+1.4)maintenance_margin_bps must be <= initial_margin_bps (spec 
+1.4)initial_margin_bps must be <= 10_000trading_fee_bps must be <= 10_000liquidation_fee_bps must be <= 10_000min_nonzero_mm_req must be > 0min_nonzero_mm_req must be strictly less than min_nonzero_im_reqmin_liquidation_abs must be <= liquidation_fee_cap (spec 
+1.4)liquidation_fee_cap must be <= MAX_PROTOCOL_FEE_ABS (spec 
+1.4)h_min must be <= h_max (spec 
+6.1)h_max must be > 0 (live admission_pair requires h_max > 0 per spec 
+1.4)resolve_price_deviation_bps must be <= MAX_RESOLVE_PRICE_DEVIATION_BPSmax_accrual_dt_slots must be > 0 (spec 
+1.4)max_abs_funding_e9_per_slot must be <= MAX_ABS_FUNDING_E9_PER_SLOTmin_funding_lifetime_slots must be >= max_accrual_dt_slots (cumulative bound must be at least as strong as per-call, spec 
+1.4)funding lifetime: ADL_ONE * MAX_ORACLE_PRICE * max_abs_funding_e9_per_slot * min_funding_lifetime_slots must fit i128 (spec 
+1.4)funding envelope: ADL_ONE * MAX_ORACLE_PRICE * max_abs_funding_e9_per_slot * max_accrual_dt_slots must fit i128 (spec 
+1.4)init_oracle_price must be in (0, MAX_ORACLE_PRICE] per spec 
+2.7I256 add overflowI256 sub overflowI256 add (bytes I256 subnum_used_accounts overflow 
+ slot leak corruption/home/runner/work/platform-tools/platform-tools/out/rust/library/alloc/src/slice.rssrc/account_info.rssrc/entrypoint.rsUnsupported PubkeyErrorsrc/pubkey.rsUnable to find a viable program address bump seed/home/runner/work/platform-tools/platform-tools/out/rust/library/alloc/src/slice.rsError: memory allocation failed, out of memoryErrorcapacity overflowalloc/src/raw_vec.rsalloc/src/string.rsa formatting trait implementation returned an error when the underlying stream did not..BorrowErrorBorrowMutErroralready borrowed: already mutably borrowed:  <= :called `Option::unwrap()` on a `None` valuepanicked at :
+ but the index is : } }core/src/fmt/num.rs0x00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899core/src/fmt/mod.rscore/src/str/mod.rs[...]begin <= end (`byte index  is not a char boundary; it is inside ) of ` is out of bounds of `core/src/unicode/printable.rs
+';>NO
+)14:EFIJNOde
+ #%&(38:HJLPSUVXZ\^`cefksx}
+./?\]_
+)147:;=IJ]
+)14:;EFIJ^de
+):;EIW[\^_de
+INOWY^_
+FGNOXZ\^~
+no7=?BE
+attempt to divide by zeronumber not in the range 0..=
+ out of range for slice of length slice index starts at  but ends at 
+custom_panic
+entrypoint
+sol_log_64_
+sol_log_
+sol_memcmp_
+sol_memset_
+sol_try_find_program_address
+sol_invoke_signed_rust
+sol_create_program_address
+sol_get_clock_sysvar
+sol_get_last_restart_slot
+sol_memcpy_
+.dynstr
+.data.rel.ro
+.rel.dyn
+.dynsym
+.dynamic
+.shstrtab
+.rodata

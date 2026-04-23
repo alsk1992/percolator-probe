@@ -21,6 +21,7 @@ mod sbf;
 mod dispatch;
 mod report;
 mod audit;
+mod bst;
 
 #[derive(Parser)]
 #[command(name = "percolator-re")]
@@ -82,6 +83,14 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         n: usize,
     },
+
+    /// Find and parse the BST-style dispatcher at the deserializer
+    /// entry. Emits (tag → arm_body_vaddr, r6_encoding) for each leaf.
+    BstDispatch {
+        binary: PathBuf,
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -94,7 +103,110 @@ fn main() -> Result<()> {
             cmd_auth_audit(&binary, json.as_deref(), follow_calls)
         }
         Cmd::Disasm { binary, pc, n } => cmd_disasm(&binary, &pc, n),
+        Cmd::BstDispatch { binary, json } => cmd_bst_dispatch(&binary, json.as_deref()),
     }
+}
+
+fn cmd_bst_dispatch(path: &std::path::Path, json_out: Option<&std::path::Path>) -> Result<()> {
+    let (_bytes, text, text_vaddr) = load_elf(path)?;
+    let insns = sbf::decode_text(&text);
+
+    let Some(root_pc) = bst::find_dispatcher_root(&insns) else {
+        println!("BST dispatcher root not found — is this the right binary?");
+        return Ok(());
+    };
+    println!(
+        "BST dispatcher root at slot {} (vaddr 0x{:x})",
+        root_pc,
+        slot_to_vaddr(root_pc, text_vaddr)
+    );
+
+    // First try the BST walker. If it misses many tags, fall back to
+    // the direct r6-enumeration which scans for `lddw r6, (tag+1)<<32`
+    // patterns in a PC window around the dispatcher.
+    let bst_entries = bst::walk_bst(&insns, root_pc);
+    let window_start = root_pc;
+    let window_end = root_pc + 600; // dispatcher region
+    let r6_entries = bst::enumerate_r6_arms(&insns, window_start, window_end);
+
+    // Merge — use the union (r6 has more coverage because defaults are implicit).
+    let mut combined: std::collections::BTreeMap<u64, usize> =
+        bst_entries.iter().map(|e| (e.tag, e.arm_body_pc)).collect();
+    for e in &r6_entries {
+        combined.entry(e.tag).or_insert(e.arm_body_pc);
+    }
+
+    let entries: Vec<bst::BstDispatchEntry> = combined
+        .into_iter()
+        .map(|(tag, arm_body_pc)| bst::BstDispatchEntry { tag, arm_body_pc })
+        .collect();
+
+    println!("\nBST walker: {} tags, r6 enumeration: {} tags, union: {} tags",
+        bst_entries.len(), r6_entries.len(), entries.len());
+    println!("Leaf entries:");
+    println!(
+        "{:>4} {:32} {:>10} {:>20}",
+        "tag", "name", "arm_vaddr", "r6_encoding"
+    );
+    println!("{}", "-".repeat(70));
+
+    #[derive(serde::Serialize)]
+    struct Out {
+        tag: u64,
+        name: String,
+        arm_vaddr: u64,
+        r6_encoding: Option<u64>,
+    }
+
+    let mut rows = Vec::with_capacity(entries.len());
+    for e in &entries {
+        let r6 = bst::extract_arm_r6_encoding(&insns, e.arm_body_pc);
+        let vaddr = slot_to_vaddr(e.arm_body_pc, text_vaddr);
+        let name = dispatch::percolator_tag_name(e.tag)
+            .unwrap_or("<unknown>")
+            .to_string();
+        println!(
+            "{:>4} {:32} 0x{:08x} {}",
+            e.tag,
+            name,
+            vaddr,
+            r6.map(|v| format!("0x{:x}", v)).unwrap_or_else(|| "-".to_string())
+        );
+        rows.push(Out {
+            tag: e.tag,
+            name,
+            arm_vaddr: vaddr,
+            r6_encoding: r6,
+        });
+    }
+
+    // Coverage check.
+    let found: std::collections::BTreeSet<u64> = entries.iter().map(|e| e.tag).collect();
+    let expected: Vec<u64> = (0..=32)
+        .filter(|t| dispatch::is_valid_source_tag(*t as u64))
+        .map(|t| t as u64)
+        .collect();
+    let missing: Vec<u64> = expected.iter().copied().filter(|t| !found.contains(t)).collect();
+    let extra: Vec<u64> = entries
+        .iter()
+        .map(|e| e.tag)
+        .filter(|t| !dispatch::is_valid_source_tag(*t))
+        .collect();
+
+    if missing.is_empty() {
+        println!("\n[OK] all 27 source-valid tags present in BST");
+    } else {
+        println!("\n[MISSING from BST] tags: {:?}", missing);
+    }
+    if !extra.is_empty() {
+        println!("[EXTRA in BST (not source-valid)] tags: {:?}", extra);
+    }
+
+    if let Some(out) = json_out {
+        fs::write(out, serde_json::to_string_pretty(&rows)?)?;
+        println!("\nJSON written to {}", out.display());
+    }
+    Ok(())
 }
 
 fn parse_hex(s: &str) -> Result<usize> {
